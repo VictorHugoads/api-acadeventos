@@ -1,8 +1,8 @@
+import cors from 'cors';
 import 'dotenv/config';
 import express from 'express';
 import mongoose from 'mongoose';
 import morgan from 'morgan';
-import cors from 'cors';
 
 const app = express();
 
@@ -69,7 +69,88 @@ const eventoSchema = new mongoose.Schema(
   }
 );
 
+const usuarioSchema = new mongoose.Schema(
+  {
+    username: {
+      type: String,
+      required: true,
+      trim: true,
+      lowercase: true,
+      unique: true
+    },
+    isOrganizer: {
+      type: Boolean,
+      required: true,
+      default: false
+    }
+  },
+  {
+    collection: "usuarios",
+    timestamps: true
+  }
+);
+
+
 const Evento = mongoose.model('Evento', eventoSchema, 'eventos');
+const Usuario = mongoose.model('Usuario', usuarioSchema, 'usuarios');
+
+function extrairDadosUsuario(dados = {}) {
+  const isOrganizer = dados.isOrganizer === true || dados.isOrganizer === 'true';
+
+  return {
+    username: typeof dados.username === 'string' ? dados.username.trim().toLowerCase() : '',
+    isOrganizer
+  };
+}
+
+async function criarUsuarioNoBanco(dados) {
+  const usuario = await Usuario.create(extrairDadosUsuario(dados));
+
+  return usuario.toObject();
+}
+
+async function verificarUsuarioPorUsername(username) {
+  const usernameNormalizado = typeof username === 'string' ? username.trim().toLowerCase() : '';
+
+  if (!usernameNormalizado) {
+    return null;
+  }
+
+  return Usuario.findOne({ username: usernameNormalizado });
+}
+
+async function verificarOrganizadorExistente(username) {
+  const usuario = await verificarUsuarioPorUsername(username);
+
+  if (!usuario || !usuario.isOrganizer) {
+    return null;
+  }
+
+  return usuario;
+}
+
+function extrairDadosEvento(dados = {}) {
+  const camposPermitidos = [
+    'titulo',
+    'descricao',
+    'dataHora',
+    'local',
+    'categoria',
+    'vagas',
+    'imagem',
+    'organizador'
+  ];
+
+  return camposPermitidos.reduce((acumulado, campo) => {
+    if (dados[campo] !== undefined) {
+      acumulado[campo] = campo === 'organizador' && typeof dados[campo] === 'string'
+        ? dados[campo].trim().toLowerCase()
+        : dados[campo];
+    }
+
+    return acumulado;
+  }, {});
+}
 
 // Calcula status do evento
 function calcularStatus(dataHora) {
@@ -106,6 +187,78 @@ app.get('/', (req, res) => {
   res.json({
     msg: 'API AcadEventos rodando'
   });
+});
+
+// Criar usuário
+app.post('/usuarios', async (req, res) => {
+  try {
+    const usuario = await criarUsuarioNoBanco(req.body);
+
+    res.status(201).json(usuario);
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({
+        error: 'Já existe um usuário com esse username.'
+      });
+    }
+
+    res.status(400).json({
+      error: err.message
+    });
+  }
+});
+
+// Login simples por username
+app.post('/usuarios/login', async (req, res) => {
+  try {
+    const { username } = req.body;
+    const usuario = await verificarUsuarioPorUsername(username);
+
+    if (!usuario) {
+      return res.status(404).json({
+        error: 'Usuário não encontrado.'
+      });
+    }
+
+    res.json({
+      ok: true,
+      usuario: {
+        id: usuario._id,
+        username: usuario.username,
+        isOrganizer: usuario.isOrganizer
+      }
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err.message
+    });
+  }
+});
+
+// Verificar se existe usuário com username
+app.get('/usuarios/:username', async (req, res) => {
+  try {
+    const usuario = await verificarUsuarioPorUsername(req.params.username);
+
+    if (!usuario) {
+      return res.status(404).json({
+        exists: false
+      });
+    }
+
+    res.json({
+      exists: true,
+      usuario: {
+        id: usuario._id,
+        username: usuario.username,
+        isOrganizer: usuario.isOrganizer
+      }
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err.message
+    });
+  }
 });
 
 // Listar eventos com filtros
@@ -176,7 +329,16 @@ app.get('/eventos/:id', async (req, res) => {
 // Criar evento
 app.post('/eventos', async (req, res) => {
   try {
-    const evento = await Evento.create(req.body);
+    const dadosEvento = extrairDadosEvento(req.body);
+    const organizador = await verificarOrganizadorExistente(dadosEvento.organizador);
+
+    if (!organizador) {
+      return res.status(400).json({
+        error: 'O organizador informado precisa existir e ter perfil de organizador.'
+      });
+    }
+
+    const evento = await Evento.create(dadosEvento);
 
     res.status(201).json(formatarEvento(evento));
   } catch (err) {
@@ -209,9 +371,25 @@ app.put('/eventos/:id', async (req, res) => {
       });
     }
 
+    if (req.body.dataHora && new Date(req.body.dataHora) < new Date()) {
+      return res.status(400).json({
+        error: 'Não é permitido alterar o evento para uma data passada.'
+      });
+    }
+
+    if (req.body.organizador) {
+      const organizador = await verificarOrganizadorExistente(req.body.organizador);
+
+      if (!organizador) {
+        return res.status(400).json({
+          error: 'O organizador informado precisa existir e ter perfil de organizador.'
+        });
+      }
+    }
+
     const evento = await Evento.findByIdAndUpdate(
       req.params.id,
-      req.body,
+      extrairDadosEvento(req.body),
       {
         new: true,
         runValidators: true
@@ -266,10 +444,17 @@ app.delete('/eventos/:id', async (req, res) => {
 app.post('/eventos/:id/inscrever', async (req, res) => {
   try {
     const { participante } = req.body;
+    const usuarioParticipante = await verificarUsuarioPorUsername(participante);
 
     if (!participante) {
       return res.status(400).json({
         error: 'Informe o nome ou email do participante.'
+      });
+    }
+
+    if (!usuarioParticipante) {
+      return res.status(404).json({
+        error: 'O participante informado precisa existir no sistema.'
       });
     }
 
@@ -293,22 +478,42 @@ app.post('/eventos/:id/inscrever', async (req, res) => {
       });
     }
 
-    if (evento.inscritos.includes(participante)) {
+    const agora = new Date();
+    const eventoAtualizado = await Evento.findOneAndUpdate(
+      {
+        _id: req.params.id,
+        dataHora: { $gte: agora },
+        inscritos: { $ne: usuarioParticipante.username },
+        $expr: { $lt: [{ $size: '$inscritos' }, '$vagas'] }
+      },
+      {
+        $addToSet: { inscritos: usuarioParticipante.username }
+      },
+      {
+        new: true,
+        runValidators: true
+      }
+    );
+
+    if (!eventoAtualizado) {
+      if (evento.inscritos.includes(usuarioParticipante.username)) {
+        return res.status(400).json({
+          error: 'Participante já inscrito neste evento.'
+        });
+      }
+
+      if (evento.inscritos.length >= evento.vagas) {
+        return res.status(400).json({
+          error: 'Evento sem vagas disponíveis.'
+        });
+      }
+
       return res.status(400).json({
-        error: 'Participante já inscrito neste evento.'
+        error: 'Não é possível se inscrever em evento que já ocorreu.'
       });
     }
 
-    if (evento.inscritos.length >= evento.vagas) {
-      return res.status(400).json({
-        error: 'Evento sem vagas disponíveis.'
-      });
-    }
-
-    evento.inscritos.push(participante);
-    await evento.save();
-
-    res.json(formatarEvento(evento));
+    res.json(formatarEvento(eventoAtualizado));
   } catch (err) {
     res.status(500).json({
       error: err.message
@@ -320,10 +525,17 @@ app.post('/eventos/:id/inscrever', async (req, res) => {
 app.post('/eventos/:id/cancelar-inscricao', async (req, res) => {
   try {
     const { participante } = req.body;
+    const usuarioParticipante = await verificarUsuarioPorUsername(participante);
 
     if (!participante) {
       return res.status(400).json({
         error: 'Informe o nome ou email do participante.'
+      });
+    }
+
+    if (!usuarioParticipante) {
+      return res.status(404).json({
+        error: 'O participante informado precisa existir no sistema.'
       });
     }
 
@@ -341,14 +553,14 @@ app.post('/eventos/:id/cancelar-inscricao', async (req, res) => {
       });
     }
 
-    if (!evento.inscritos.includes(participante)) {
+    if (!evento.inscritos.includes(usuarioParticipante.username)) {
       return res.status(400).json({
         error: 'Participante não está inscrito neste evento.'
       });
     }
 
     evento.inscritos = evento.inscritos.filter(
-      inscrito => inscrito !== participante
+      inscrito => inscrito !== usuarioParticipante.username
     );
 
     await evento.save();
@@ -364,10 +576,16 @@ app.post('/eventos/:id/cancelar-inscricao', async (req, res) => {
 // Ver minhas inscrições
 app.get('/inscricoes/:participante', async (req, res) => {
   try {
-    const participante = req.params.participante;
+    const usuarioParticipante = await verificarUsuarioPorUsername(req.params.participante);
+
+    if (!usuarioParticipante) {
+      return res.status(404).json({
+        error: 'O participante informado precisa existir no sistema.'
+      });
+    }
 
     const eventos = await Evento.find({
-      inscritos: participante
+      inscritos: usuarioParticipante.username
     }).sort({ dataHora: 1 });
 
     res.json(eventos.map(formatarEvento));
